@@ -1,6 +1,15 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:http/http.dart' as http;
+import 'dart:convert';
+import 'dart:io';
+import 'package:path_provider/path_provider.dart';
+
+// Cloud Function endpoint and constant prompt for the AI agent
+const String kAICloudFunctionUrl =
+    'https://us-central1-studious-apex-468917-c2.cloudfunctions.net/web_task_AI';
+const String kAIFixedPrompt = 'Answer the question on the attached HTML page. If there is request to click on the page, return the HTML filed name to click surounded by <>';
 
 enum OperationType {
   navigate,
@@ -167,7 +176,7 @@ class _LandingScreenState extends State<LandingScreen> {
                 final updated = List<SavedPage>.from(_pages)
                   ..add(SavedPage(id: id, name: name, url: url));
                 await _savePages(updated);
-                if (mounted) Navigator.pop(context);
+                if (context.mounted) Navigator.pop(context);
               },
               child: const Text('Save'),
             ),
@@ -183,24 +192,54 @@ class _LandingScreenState extends State<LandingScreen> {
       appBar: AppBar(
         title: const Text('Your Pages'),
       ),
-      body: _pages.isEmpty
-          ? const Center(child: Text('No pages yet. Tap + to add one.'))
-          : ListView.separated(
-              itemCount: _pages.length,
-              separatorBuilder: (_, __) => const Divider(height: 1),
-              itemBuilder: (context, index) {
-                final page = _pages[index];
-                return ListTile(
-                  title: Text(page.name),
-                  onTap: () {
-                    Navigator.of(context).push(
-                      MaterialPageRoute(builder: (_) => HomeScreen(initialUrl: page.url)),
+      body: Stack(
+        children: [
+          _pages.isEmpty
+              ? const Center(child: Text('No pages yet. Tap + to add one.'))
+              : ListView.separated(
+                  itemCount: _pages.length,
+                  separatorBuilder: (_, __) => const Divider(height: 1),
+                  itemBuilder: (context, index) {
+                    final page = _pages[index];
+                    return ListTile(
+                      title: Text(page.name),
+                      onTap: () {
+                        Navigator.of(context).push(
+                          MaterialPageRoute(builder: (_) => HomeScreen(initialUrl: page.url)),
+                        );
+                      },
                     );
                   },
-                );
+                ),
+          Positioned(
+            right: 16,
+            bottom: 16,
+            child: FloatingActionButton(
+              heroTag: 'ai-landing-fab',
+              tooltip: 'AI agent',
+              onPressed: () async {
+                if (_pages.isNotEmpty) {
+                  final url = _pages.first.url;
+                  if (!mounted) return;
+                  Navigator.of(context).push(
+                    MaterialPageRoute(
+                      builder: (_) => HomeScreen(
+                        initialUrl: url,
+                        autoOpenAIAgent: true,
+                      ),
+                    ),
+                  );
+                } else {
+                  await _promptAddPage();
+                }
               },
+              child: const Icon(Icons.smart_toy_outlined),
             ),
+          ),
+        ],
+      ),
       floatingActionButton: FloatingActionButton(
+        heroTag: 'add-landing-fab',
         onPressed: _promptAddPage,
         child: const Icon(Icons.add),
       ),
@@ -211,7 +250,8 @@ class _LandingScreenState extends State<LandingScreen> {
 
 class HomeScreen extends StatefulWidget {
   final String? initialUrl;
-  const HomeScreen({super.key, this.initialUrl});
+  final bool autoOpenAIAgent;
+  const HomeScreen({super.key, this.initialUrl, this.autoOpenAIAgent = false});
 
   @override
   State<HomeScreen> createState() => _HomeScreenState();
@@ -225,6 +265,7 @@ class _HomeScreenState extends State<HomeScreen> {
   List<OperationPreset> _presets = [];
   OperationPreset? _selectedPreset;
   bool _autoLoadedInitial = false;
+  bool _autoOpenedAgent = false;
 
   @override
   void initState() {
@@ -259,6 +300,110 @@ class _HomeScreenState extends State<HomeScreen> {
     try {
       await _webViewController!.loadUrl(urlRequest: URLRequest(url: WebUri(url)));
     } catch (_) {}
+  }
+
+  
+
+  Future<String> _capturePageSnapshotJson() async {
+    try {
+      if (_webViewController == null) return jsonEncode({});
+      // Give the page a brief moment to finish dynamic rendering
+      await Future.delayed(const Duration(milliseconds: 1200));
+      final script = r'''(function(){
+  try {
+    function collectResources(){
+      const out=[];
+      const list=[['img','src'],['script','src'],['link','href'],['a','href'],['source','src'],['video','src'],['audio','src'],['iframe','src']];
+      for (const [sel,attr] of list){
+        document.querySelectorAll(sel+'['+attr+']').forEach(el=>{
+          const raw=el.getAttribute(attr);
+          if(!raw) return;
+          let absolute=raw;
+          try{ absolute=new URL(raw, document.baseURI).href; }catch(e){}
+          out.push({tag:(el.tagName||'').toLowerCase(), attr, value: raw, absolute});
+        });
+      }
+      return out;
+    }
+
+    function includeShadowRootsInClone(root, cloneRoot){
+      const origEls = root.querySelectorAll('*');
+      const cloneEls = cloneRoot.querySelectorAll('*');
+      const len = Math.min(origEls.length, cloneEls.length);
+      for(let i=0;i<len;i++){
+        const o=origEls[i];
+        const c=cloneEls[i];
+        if(o && c && o.shadowRoot){
+          const t = document.createElement('template');
+          try { t.setAttribute('shadowrootmode', o.shadowRoot.mode || 'open'); } catch(e) {}
+          t.innerHTML = o.shadowRoot.innerHTML;
+          c.prepend(t);
+        }
+      }
+    }
+
+    const url=location.href;
+    const origin=location.origin;
+    const path=location.pathname;
+    const pathSegments=path.split('/').filter(Boolean);
+    const baseHref=document.baseURI;
+    const title=document.title||'';
+
+    // Clone the document and augment it
+    const clone=document.documentElement.cloneNode(true);
+    includeShadowRootsInClone(document, clone);
+    let head=clone.querySelector('head');
+    if(!head){ head=clone.firstElementChild; }
+    if(head && !clone.querySelector('head base')){
+      const base=document.createElement('base');
+      base.setAttribute('href', baseHref);
+      head.prepend(base);
+    }
+    const html='<!DOCTYPE html>\n'+clone.outerHTML;
+
+    // Capture same-origin iframe HTML where possible
+    const iframes = Array.from(document.querySelectorAll('iframe')).map(ifr=>{
+      const src=ifr.getAttribute('src')||'';
+      let absolute=src; try{ absolute=new URL(src||'', document.baseURI).href; }catch(e){}
+      let frameHtml=''; let sameOrigin=false;
+      try{
+        const doc=ifr.contentDocument;
+        if(doc && doc.documentElement){
+          sameOrigin=true;
+          frameHtml='<!DOCTYPE html>\n'+doc.documentElement.outerHTML;
+        }
+      }catch(e){}
+      return {src, absolute, sameOrigin, html: frameHtml};
+    });
+
+    const resources=collectResources();
+    return JSON.stringify({
+      url, origin, path, pathSegments, baseHref, title,
+      html, resources, iframes
+    });
+  } catch(e) {
+    return JSON.stringify({error: String(e)});
+  }
+})()''';
+
+      final result = await _webViewController!.evaluateJavascript(source: script);
+      final snapshotJson = result?.toString() ?? jsonEncode({});
+
+      // Persist the HTML part for debugging / sharing
+      try {
+        final Map<String, dynamic> data = jsonDecode(snapshotJson) as Map<String, dynamic>;
+        final html = (data['html'] ?? '').toString();
+        if (html.isNotEmpty) {
+          final dir = await getTemporaryDirectory();
+          final file = File('${dir.path}/webview_snapshot_${DateTime.now().millisecondsSinceEpoch}.html');
+          await file.writeAsString(html, encoding: utf8);
+        }
+      } catch (_) {}
+
+      return snapshotJson;
+    } catch (e) {
+      return jsonEncode({'error': e.toString()});
+    }
   }
 
   Future<List<OperationPreset>> _loadPresetsCompat(SharedPreferences prefs) async {
@@ -373,7 +518,7 @@ class _HomeScreenState extends State<HomeScreen> {
                   updated.add(newPreset);
                 }
                 await _savePresets(updated);
-                if (mounted) Navigator.pop(context);
+                if (context.mounted) Navigator.pop(context);
               },
               child: const Text('Save'),
             ),
@@ -405,13 +550,13 @@ class _HomeScreenState extends State<HomeScreen> {
     switch (preset.type) {
       case OperationType.navigate:
         final url = preset.value.replaceAll("'", "%27");
-        return "window.location.href='" + url + "'";
+        return "window.location.href='$url'";
       case OperationType.click:
-        return "(function(){var el=document.querySelector('" + preset.selector.replaceAll("'", "\\'") + "'); if(el){el.click(); return 'clicked';} return 'not found';})()";
+        return "(function(){var el=document.querySelector('${preset.selector.replaceAll("'", "\\'")}'); if(el){el.click(); return 'clicked';} return 'not found';})()";
       case OperationType.type:
-        return "(function(){var el=document.querySelector('" + preset.selector.replaceAll("'", "\\'") + "'); if(el){el.focus(); el.value='" + preset.value.replaceAll("'", "\\'") + "'; el.dispatchEvent(new Event('input',{bubbles:true})); return 'typed';} return 'not found';})()";
+        return "(function(){var el=document.querySelector('${preset.selector.replaceAll("'", "\\'")}'); if(el){el.focus(); el.value='${preset.value.replaceAll("'", "\\'")}'; el.dispatchEvent(new Event('input',{bubbles:true})); return 'typed';} return 'not found';})()";
       case OperationType.extractText:
-        return "(function(){var el=document.querySelector('" + preset.selector.replaceAll("'", "\\'") + "'); return el? (el.innerText||el.textContent||''): ''})()";
+        return "(function(){var el=document.querySelector('${preset.selector.replaceAll("'", "\\'")}'); return el? (el.innerText||el.textContent||''): ''})()";
     }
   }
 
@@ -440,132 +585,153 @@ class _HomeScreenState extends State<HomeScreen> {
           )
         ],
       ),
-      body: Column(
+      body: Stack(
         children: [
-          if (widget.initialUrl == null || widget.initialUrl!.isNotEmpty == false)
-            Padding(
-              padding: const EdgeInsets.all(8.0),
-              child: Row(
-                children: [
-                  Expanded(
-                    child: TextField(
-                      controller: _urlController,
-                      decoration: const InputDecoration(
-                        labelText: 'Target website URL',
-                        hintText: 'https://example.com',
+          Column(
+            children: [
+              if (widget.initialUrl == null || widget.initialUrl!.isNotEmpty == false)
+                Padding(
+                  padding: const EdgeInsets.all(8.0),
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: TextField(
+                          controller: _urlController,
+                          decoration: const InputDecoration(
+                            labelText: 'Target website URL',
+                            hintText: 'https://example.com',
+                          ),
+                          onSubmitted: (v) async {
+                            final url = v.trim();
+                            if (url.isEmpty) return;
+                            await _saveTargetUrl(url);
+                            if (_webViewController != null) {
+                              await _webViewController!.loadUrl(urlRequest: URLRequest(url: WebUri(url)));
+                            }
+                          },
+                        ),
                       ),
-                      onSubmitted: (v) async {
-                        final url = v.trim();
-                        if (url.isEmpty) return;
-                        await _saveTargetUrl(url);
-                        if (_webViewController != null) {
-                          await _webViewController!.loadUrl(urlRequest: URLRequest(url: WebUri(url)));
-                        }
-                      },
+                      const SizedBox(width: 8),
+                      ElevatedButton(
+                        onPressed: () async {
+                          final url = _urlController.text.trim();
+                          if (url.isEmpty) return;
+                          await _saveTargetUrl(url);
+                          if (_webViewController != null) {
+                            await _webViewController!.loadUrl(urlRequest: URLRequest(url: WebUri(url)));
+                          }
+                        },
+                        child: const Text('Open'),
+                      )
+                    ],
+                  ),
+                ),
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 8.0),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: DropdownButton<OperationPreset>(
+                        isExpanded: true,
+                        value: _selectedPreset,
+                        hint: const Text('Choose operation preset'),
+                        items: _presets
+                            .map((p) => DropdownMenuItem(value: p, child: Text(p.label)))
+                            .toList(),
+                        onChanged: (p) => setState(() => _selectedPreset = p),
+                      ),
                     ),
-                  ),
-                  const SizedBox(width: 8),
-                  ElevatedButton(
-                    onPressed: () async {
-                      final url = _urlController.text.trim();
-                      if (url.isEmpty) return;
-                      await _saveTargetUrl(url);
-                      if (_webViewController != null) {
-                        await _webViewController!.loadUrl(urlRequest: URLRequest(url: WebUri(url)));
-                      }
-                    },
-                    child: const Text('Open'),
-                  )
-                ],
+                    const SizedBox(width: 8),
+                    ElevatedButton(
+                      onPressed: _selectedPreset == null ? null : () => _runPreset(_selectedPreset!),
+                      child: const Text('Run'),
+                    ),
+                  ],
+                ),
               ),
-            ),
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 8.0),
-            child: Row(
-              children: [
-                Expanded(
-                  child: DropdownButton<OperationPreset>(
-                    isExpanded: true,
-                    value: _selectedPreset,
-                    hint: const Text('Choose operation preset'),
-                    items: _presets
-                        .map((p) => DropdownMenuItem(value: p, child: Text(p.label)))
-                        .toList(),
-                    onChanged: (p) => setState(() => _selectedPreset = p),
+              const Divider(height: 1),
+              Expanded(
+                child: InAppWebView(
+                  initialUrlRequest: _savedUrl != null ? URLRequest(url: WebUri(_savedUrl!)) : null,
+                  initialSettings: InAppWebViewSettings(
+                    javaScriptEnabled: true,
+                    javaScriptCanOpenWindowsAutomatically: true,
+                    useHybridComposition: false,
+                    incognito: false,
+                    useShouldOverrideUrlLoading: true,
+                    mediaPlaybackRequiresUserGesture: true,
+                    allowsBackForwardNavigationGestures: true,
+                    supportMultipleWindows: true,
+                    thirdPartyCookiesEnabled: true,
+                    sharedCookiesEnabled: true,
+                    domStorageEnabled: true,
+                    databaseEnabled: true,
+                    saveFormData: true,
+                    mixedContentMode: MixedContentMode.MIXED_CONTENT_ALWAYS_ALLOW,
+                    userAgent: 'Mozilla/5.0 (Linux; Android 13; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36',
                   ),
+                  onWebViewCreated: (controller) {
+                    _webViewController = controller;
+                    _maybeAutoLoadInitialUrl();
+                  },
+                  shouldOverrideUrlLoading: (controller, navigationAction) async {
+                    final uri = navigationAction.request.url;
+                    if (uri == null) return NavigationActionPolicy.ALLOW;
+                    final scheme = uri.scheme.toLowerCase();
+                    switch (scheme) {
+                      case 'http':
+                      case 'https':
+                      case 'about':
+                      case 'data':
+                      case 'javascript':
+                      case 'blob':
+                        return NavigationActionPolicy.ALLOW;
+                      default:
+                        // Allow non-http(s) as well so flows that rely on intents/custom schemes don't get blocked.
+                        return NavigationActionPolicy.ALLOW;
+                    }
+                  },
+                  onCreateWindow: (controller, createWindowRequest) async {
+                    final req = createWindowRequest.request;
+                    if (req.url != null) {
+                      await controller.loadUrl(urlRequest: req);
+                    }
+                    // Return false to prevent creating a separate WebView; we loaded it in the same one.
+                    return false;
+                  },
+                  onLoadStop: (controller, url) async {
+                    setState(() => _isLoading = false);
+                    await _attemptAutoLogin();
+                    if (widget.autoOpenAIAgent && !_autoOpenedAgent) {
+                      _autoOpenedAgent = true;
+                      if (!mounted) return;
+                      await _openAIAgentDialog(
+                        context,
+                        htmlProvider: _capturePageSnapshotJson,
+                      );
+                    }
+                  },
+                  onLoadStart: (controller, url) {
+                    setState(() => _isLoading = true);
+                  },
                 ),
-                const SizedBox(width: 8),
-                ElevatedButton(
-                  onPressed: _selectedPreset == null ? null : () => _runPreset(_selectedPreset!),
-                  child: const Text('Run'),
-                ),
-              ],
+              ),
+              if (_isLoading) const LinearProgressIndicator(minHeight: 2),
+            ],
+          ),
+          Positioned(
+            right: 16,
+            bottom: 16,
+            child: FloatingActionButton(
+              heroTag: 'ai-home-fab',
+              tooltip: 'AI agent',
+              onPressed: () => _openAIAgentDialog(
+                context,
+                htmlProvider: _capturePageSnapshotJson,
+              ),
+              child: const Icon(Icons.smart_toy_outlined),
             ),
           ),
-          const Divider(height: 1),
-          Expanded(
-            child: InAppWebView(
-              initialUrlRequest: _savedUrl != null ? URLRequest(url: WebUri(_savedUrl!)) : null,
-              initialOptions: InAppWebViewGroupOptions(
-                android: AndroidInAppWebViewOptions(
-                  useHybridComposition: false,
-                ),
-              ),
-              initialSettings: InAppWebViewSettings(
-                javaScriptEnabled: true,
-                javaScriptCanOpenWindowsAutomatically: true,
-                incognito: false,
-                useShouldOverrideUrlLoading: true,
-                mediaPlaybackRequiresUserGesture: true,
-                allowsBackForwardNavigationGestures: true,
-                supportMultipleWindows: true,
-                thirdPartyCookiesEnabled: true,
-                sharedCookiesEnabled: true,
-                domStorageEnabled: true,
-                databaseEnabled: true,
-                saveFormData: true,
-                mixedContentMode: MixedContentMode.MIXED_CONTENT_ALWAYS_ALLOW,
-                userAgent: 'Mozilla/5.0 (Linux; Android 13; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36',
-              ),
-              onWebViewCreated: (controller) {
-                _webViewController = controller;
-                _maybeAutoLoadInitialUrl();
-              },
-              shouldOverrideUrlLoading: (controller, navigationAction) async {
-                final uri = navigationAction.request.url;
-                if (uri == null) return NavigationActionPolicy.ALLOW;
-                final scheme = uri.scheme.toLowerCase();
-                switch (scheme) {
-                  case 'http':
-                  case 'https':
-                  case 'about':
-                  case 'data':
-                  case 'javascript':
-                  case 'blob':
-                    return NavigationActionPolicy.ALLOW;
-                  default:
-                    // Allow non-http(s) as well so flows that rely on intents/custom schemes don't get blocked.
-                    return NavigationActionPolicy.ALLOW;
-                }
-              },
-              onCreateWindow: (controller, createWindowRequest) async {
-                final req = createWindowRequest.request;
-                if (req.url != null) {
-                  await controller.loadUrl(urlRequest: req);
-                }
-                // Return false to prevent creating a separate WebView; we loaded it in the same one.
-                return false;
-              },
-              onLoadStop: (controller, url) async {
-                setState(() => _isLoading = false);
-                await _attemptAutoLogin();
-              },
-              onLoadStart: (controller, url) {
-                setState(() => _isLoading = true);
-              },
-            ),
-          ),
-          if (_isLoading) const LinearProgressIndicator(minHeight: 2),
         ],
       ),
     );
@@ -625,16 +791,16 @@ class _HomeScreenState extends State<HomeScreen> {
                   final js = _buildOneTimeLoginJs(username: username, password: password, userSelector: userSel.isEmpty ? null : userSel, passSelector: passSel.isEmpty ? null : passSel);
                   try {
                     await _webViewController!.evaluateJavascript(source: js);
-                    if (mounted) {
+                    if (context.mounted) {
                       ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Filled login fields. Submit attempted if button found.')));
                     }
                   } catch (e) {
-                    if (mounted) {
+                    if (context.mounted) {
                       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Login helper failed: $e')));
                     }
                   }
                 }
-                if (mounted) Navigator.pop(context);
+                if (context.mounted) Navigator.pop(context);
               },
               child: const Text('Fill now'),
             ),
@@ -646,11 +812,143 @@ class _HomeScreenState extends State<HomeScreen> {
 
   String _buildOneTimeLoginJs({required String username, required String password, String? userSelector, String? passSelector}) {
     String esc(String s) => s.replaceAll("\\", "\\\\").replaceAll("'", "\\'");
-    final uSel = userSelector != null ? "document.querySelector('" + esc(userSelector) + "')" :
+    final uSel = userSelector != null ? "document.querySelector('${esc(userSelector)}')" :
         "(document.querySelector('input[type=email],input[type=text][name*=email i],input[type=text][name*=user i],input[name*=email i],input[name*=user i]') || document.querySelector('input[type=text],input:not([type])'))";
-    final pSel = passSelector != null ? "document.querySelector('" + esc(passSelector) + "')" :
+    final pSel = passSelector != null ? "document.querySelector('${esc(passSelector)}')" :
         "document.querySelector('input[type=password]')";
-    final js = "(function(){var uEl=" + uSel + "; var pEl=" + pSel + "; if(uEl){uEl.focus(); uEl.value='" + esc(username) + "'; uEl.dispatchEvent(new Event('input',{bubbles:true}));} if(pEl){pEl.focus(); pEl.value='" + esc(password) + "'; pEl.dispatchEvent(new Event('input',{bubbles:true}));} var btn=null; var cs=Array.from(document.querySelectorAll('button, input[type=submit]')); for(var i=0;i<cs.length;i++){var b=cs[i]; var t=(b.innerText||b.textContent||''); if((b.type||'').toLowerCase()=='submit' || /log\\s*in|sign\\s*in/i.test(t) || /login|signin/i.test(b.id||'') || /login|signin/i.test(b.name||'')){btn=b; break;}} if(btn){btn.click(); return 'filled+submitted';} return 'filled';})()";
+    final js = "(function(){var uEl=$uSel; var pEl=$pSel; if(uEl){uEl.focus(); uEl.value='${esc(username)}'; uEl.dispatchEvent(new Event('input',{bubbles:true}));} if(pEl){pEl.focus(); pEl.value='${esc(password)}'; pEl.dispatchEvent(new Event('input',{bubbles:true}));} var btn=null; var cs=Array.from(document.querySelectorAll('button, input[type=submit]')); for(var i=0;i<cs.length;i++){var b=cs[i]; var t=(b.innerText||b.textContent||''); if((b.type||'').toLowerCase()=='submit' || /log\\s*in|sign\\s*in/i.test(t) || /login|signin/i.test(b.id||'') || /login|signin/i.test(b.name||'')){btn=b; break;}} if(btn){btn.click(); return 'filled+submitted';} return 'filled';})()";
     return js;
   }
+}
+
+Future<void> _openAIAgentDialog(BuildContext context, {required Future<String> Function() htmlProvider}) async {
+  // Use a navigator key lookup via contexts where this function is called.
+  // The dialog maintains its own previousAnswer state until cancelled.
+  final promptController = TextEditingController();
+  String previousAnswer = '';
+  String aiAnswer = '';
+  String? error;
+  bool sending = false;
+
+  await showDialog(
+    context: context,
+    barrierDismissible: false,
+    builder: (context) {
+      return StatefulBuilder(
+        builder: (context, setState) {
+          Future<void> send() async {
+            final userPrompt = promptController.text.trim();
+            if (userPrompt.isEmpty) return;
+            setState(() {
+              sending = true;
+              error = null;
+            });
+            try {
+              final snapshotOrHtml = await htmlProvider();
+              String pageHtml = '';
+              Map<String, dynamic>? pageSnapshot;
+              try {
+                final decoded = jsonDecode(snapshotOrHtml);
+                if (decoded is Map<String, dynamic> && decoded.containsKey('html')) {
+                  pageSnapshot = decoded;
+                  pageHtml = (decoded['html'] ?? '').toString();
+                } else {
+                  pageHtml = snapshotOrHtml;
+                }
+              } catch (_) {
+                pageHtml = snapshotOrHtml;
+              }
+              final uri = Uri.parse(kAICloudFunctionUrl);
+              final resp = await http.post(
+                uri,
+                headers: {'Content-Type': 'application/json'},
+                body: jsonEncode({
+                  'userPrompt': userPrompt,
+                  'previousAnswer': previousAnswer,
+                  'pageHtml': pageHtml,
+                  'pageSnapshot': pageSnapshot,
+                  'constantPrompt': kAIFixedPrompt,
+                }),
+              );
+              if (resp.statusCode == 200) {
+                final data = jsonDecode(resp.body) as Map<String, dynamic>;
+                final answer = (data['answer'] ?? '').toString();
+                setState(() {
+                  aiAnswer = answer;
+                  previousAnswer = answer;
+                });
+              } else {
+                setState(() {
+                  error = 'AI request failed (${resp.statusCode})';
+                });
+              }
+            } catch (e) {
+              setState(() {
+                error = 'AI request error: $e';
+              });
+            } finally {
+              setState(() {
+                sending = false;
+              });
+            }
+          }
+
+          return AlertDialog(
+            title: const Text('AI Agent'),
+            content: SizedBox(
+              width: 520,
+              child: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    TextField(
+                      controller: promptController,
+                      minLines: 1,
+                      maxLines: 5,
+                      decoration: const InputDecoration(labelText: 'Describe what to do'),
+                    ),
+                    const SizedBox(height: 12),
+                    if (aiAnswer.isNotEmpty)
+                      Container(
+                        constraints: BoxConstraints(
+                          maxHeight: MediaQuery.of(context).size.height * 0.6,
+                        ),
+                        padding: const EdgeInsets.all(12),
+                        decoration: BoxDecoration(
+                          border: Border.all(color: Colors.black12),
+                          borderRadius: BorderRadius.circular(8),
+                          color: Colors.black.withOpacity(0.02),
+                        ),
+                        child: SingleChildScrollView(child: Text(aiAnswer)),
+                      ),
+                    if (error != null) ...[
+                      const SizedBox(height: 8),
+                      Text(error!, style: const TextStyle(color: Colors.red)),
+                    ]
+                  ],
+                ),
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: sending
+                    ? null
+                    : () {
+                        Navigator.of(context).pop();
+                      },
+                child: const Text('Cancel'),
+              ),
+              ElevatedButton(
+                onPressed: sending ? null : send,
+                child: sending
+                    ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2))
+                    : const Text('Send'),
+              ),
+            ],
+          );
+        },
+      );
+    },
+  );
 }
