@@ -5,6 +5,8 @@ import 'package:http/http.dart' as http;
 import 'dart:convert';
 import 'dart:io';
 import 'package:path_provider/path_provider.dart';
+import 'package:web_tasks_bot/services/tts_service.dart';
+import 'package:web_tasks_bot/services/voice_text_service.dart';
 
 // Cloud Function endpoint and constant prompt for the AI agent
 const String kAICloudFunctionUrl =
@@ -73,7 +75,9 @@ class OperationPreset {
       );
 }
 
-void main() {
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  try { await VoiceTextService.instance.loadFromAssets(); } catch (e) { print('VoiceTextService preload failed: '+e.toString()); }
   runApp(const MyApp());
 }
 
@@ -191,6 +195,30 @@ class _LandingScreenState extends State<LandingScreen> {
     return Scaffold(
       appBar: AppBar(
         title: const Text('Your Pages'),
+        actions: [
+          PopupMenuButton<MainMenuAction>(
+            onSelected: (action) async {
+              switch (action) {
+                case MainMenuAction.language:
+                  await showLanguageSelectionDialog(context);
+                  break;
+                case MainMenuAction.about:
+                  await showAboutDialog(context);
+                  break;
+              }
+            },
+            itemBuilder: (context) => [
+              const PopupMenuItem(
+                value: MainMenuAction.language,
+                child: Text('Language'),
+              ),
+              const PopupMenuItem(
+                value: MainMenuAction.about,
+                child: Text('About'),
+              ),
+            ],
+          ),
+        ],
       ),
       body: Stack(
         children: [
@@ -211,6 +239,20 @@ class _LandingScreenState extends State<LandingScreen> {
                     );
                   },
                 ),
+          Center(
+            child: ElevatedButton.icon(
+              icon: const Icon(Icons.play_circle_fill, size: 40),
+              label: const Text('Actions', style: TextStyle(fontSize: 24)),
+              style: ElevatedButton.styleFrom(
+                padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 24),
+                minimumSize: const Size(280, 120),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+              ),
+              onPressed: () async {
+                await TtsService.instance.speakMessageById('1', preferEnglish: true);
+              },
+            ),
+          ),
           Positioned(
             right: 16,
             bottom: 16,
@@ -560,6 +602,76 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  Future<void> _pressButtonByToken(String token) async {
+    if (_webViewController == null) return;
+    final js = _buildClickByTokenJs(token);
+    try {
+      final result = await _webViewController!.evaluateJavascript(source: js);
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('AI action: ${result ?? 'done'}')),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('AI click failed: $e')),
+      );
+    }
+  }
+
+  String _buildClickByTokenJs(String token) {
+    String esc(String s) => s.replaceAll("\\", "\\\\").replaceAll("'", "\\'");
+    final t = esc(token);
+    return """(function(){
+  try{
+    var tok='${t}';
+    var tokTrim=tok.trim();
+    var tokLower=tokTrim.toLowerCase();
+    function norm(s){return (s||'').replace(/\s+/g,' ').trim().toLowerCase();}
+    function isVisible(el){try{var r=el.getBoundingClientRect(); return r.width>0 && r.height>0;}catch(e){return true;}}
+    function tryClick(el){if(!el) return false; try{el.scrollIntoView({block:'center'});}catch(e){}; try{el.focus&&el.focus();}catch(e){}; try{el.dispatchEvent(new MouseEvent('mouseover',{bubbles:true}));}catch(e){}; try{el.dispatchEvent(new MouseEvent('mousedown',{bubbles:true}));}catch(e){}; try{el.click();}catch(e){}; try{el.dispatchEvent(new MouseEvent('mouseup',{bubbles:true}));}catch(e){}; return true;}
+
+    // 1) If token looks like a selector, try it directly
+    var el=null;
+    var looksLikeSelector=/[.#\[\]> :]/.test(tokTrim);
+    if(looksLikeSelector){
+      try{ el=document.querySelector(tokTrim); }catch(e){}
+      if(el){ tryClick(el); return 'clicked:selector'; }
+    }
+
+    // 2) ID
+    el=document.getElementById(tokTrim);
+    if(el){ tryClick(el); return 'clicked:id'; }
+
+    // 3) Elements with matching name/id attributes among typical clickable elements
+    var candidates=Array.from(document.querySelectorAll('button, [role="button"], input[type=button], input[type=submit], a[role="button"], a.button'));
+    var match=candidates.find(function(e){var id=(e.id||''); var name=(e.getAttribute('name')||''); return id===tokTrim || name===tokTrim;});
+    if(!match){
+      // 4) aria-label or value equals
+      match=candidates.find(function(e){return norm(e.getAttribute('aria-label'))===tokLower || norm(e.value)===tokLower;});
+    }
+    if(!match){
+      // 5) Exact text match
+      match=candidates.find(function(e){return norm(e.innerText||e.textContent)===tokLower;});
+    }
+    if(!match){
+      // 6) Partial text match
+      match=candidates.find(function(e){return norm(e.innerText||e.textContent).includes(tokLower);});
+    }
+    if(!match){
+      // 7) Label[for] association
+      var lbl=Array.from(document.querySelectorAll('label')).find(function(l){return norm(l.innerText||l.textContent)===tokLower || norm(l.innerText||l.textContent).includes(tokLower);});
+      if(lbl){
+        var forId=lbl.getAttribute('for');
+        if(forId){ match=document.getElementById(forId); }
+      }
+    }
+    if(match){ if(isVisible(match)){ tryClick(match); return 'clicked:match'; } else { tryClick(match); return 'clicked:hidden'; } }
+    return 'not found';
+  }catch(e){ return 'error:'+String(e); }
+})()""";
+  }
+
   Future<void> _attemptAutoLogin() async {
     if (_webViewController == null) return;
     // Heuristic: focus first password field to trigger OS/browser autofill; if credentials saved, the popup should appear.
@@ -582,7 +694,29 @@ class _HomeScreenState extends State<HomeScreen> {
             tooltip: 'Add operation',
             onPressed: () => _promptAddOrEditPreset(),
             icon: const Icon(Icons.add_task_outlined),
-          )
+          ),
+          PopupMenuButton<MainMenuAction>(
+            onSelected: (action) async {
+              switch (action) {
+                case MainMenuAction.language:
+                  await showLanguageSelectionDialog(context);
+                  break;
+                case MainMenuAction.about:
+                  await showAboutDialog(context);
+                  break;
+              }
+            },
+            itemBuilder: (context) => [
+              const PopupMenuItem(
+                value: MainMenuAction.language,
+                child: Text('Language'),
+              ),
+              const PopupMenuItem(
+                value: MainMenuAction.about,
+                child: Text('About'),
+              ),
+            ],
+          ),
         ],
       ),
       body: Stack(
@@ -708,6 +842,9 @@ class _HomeScreenState extends State<HomeScreen> {
                       await _openAIAgentDialog(
                         context,
                         htmlProvider: _capturePageSnapshotJson,
+                        onAngleBracketCommand: (token) async {
+                          await _pressButtonByToken(token);
+                        },
                       );
                     }
                   },
@@ -728,6 +865,7 @@ class _HomeScreenState extends State<HomeScreen> {
               onPressed: () => _openAIAgentDialog(
                 context,
                 htmlProvider: _capturePageSnapshotJson,
+                onAngleBracketCommand: (token) async { await _pressButtonByToken(token); },
               ),
               child: const Icon(Icons.smart_toy_outlined),
             ),
@@ -821,7 +959,48 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 }
 
-Future<void> _openAIAgentDialog(BuildContext context, {required Future<String> Function() htmlProvider}) async {
+enum MainMenuAction { language, about }
+
+Future<void> showLanguageSelectionDialog(BuildContext context) async {
+  await showDialog(
+    context: context,
+    builder: (context) {
+      return SimpleDialog(
+        title: const Text('Language'),
+        children: [
+          SimpleDialogOption(
+            onPressed: () => Navigator.of(context).pop('En'),
+            child: const Text('En'),
+          ),
+          SimpleDialogOption(
+            onPressed: () => Navigator.of(context).pop('Heb'),
+            child: const Text('Heb'),
+          ),
+        ],
+      );
+    },
+  );
+}
+
+Future<void> showAboutDialog(BuildContext context) async {
+  await showDialog(
+    context: context,
+    builder: (context) {
+      return AlertDialog(
+        title: const Text('About'),
+        content: const Text('Web Tasks Bot. Version 0.1'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('Close'),
+          ),
+        ],
+      );
+    },
+  );
+}
+
+Future<void> _openAIAgentDialog(BuildContext context, {required Future<String> Function() htmlProvider, Future<void> Function(String token)? onAngleBracketCommand}) async {
   // Use a navigator key lookup via contexts where this function is called.
   // The dialog maintains its own previousAnswer state until cancelled.
   final promptController = TextEditingController();
@@ -873,9 +1052,51 @@ Future<void> _openAIAgentDialog(BuildContext context, {required Future<String> F
               if (resp.statusCode == 200) {
                 final data = jsonDecode(resp.body) as Map<String, dynamic>;
                 final answer = (data['answer'] ?? '').toString();
+                // If the answer contains a <...> token, execute and close dialog immediately
+                try {
+                  final regex = RegExp(r'<([^<>]+)>' );
+                  final match = regex.firstMatch(answer);
+                  if (match != null) {
+                    final token = match.group(1)?.trim();
+                    if (token != null && token.isNotEmpty && onAngleBracketCommand != null) {
+                      try {
+                        await onAngleBracketCommand(token);
+                      } catch (_) {}
+                      if (context.mounted) {
+                        try { await TtsService.instance.stop(); } catch (_) {}
+                        Navigator.of(context).pop();
+                      }
+                      return;
+                    }
+                  }
+                } catch (_) {}
+
+                // No angle-bracket token; show the AI response as usual
+                Future<void>? speechDone;
+                try {
+                  if (answer.trim().isNotEmpty) {
+                    // Start speaking immediately; this Future completes when speech ends
+                    // because awaitSpeakCompletion(true) is enabled in TtsService.
+                    speechDone = TtsService.instance.speak(answer);
+                  }
+                } catch (_) {}
                 setState(() {
                   aiAnswer = answer;
                   previousAnswer = answer;
+                });
+                // Auto-clear only after BOTH: 20 seconds elapsed AND TTS finished speaking
+                final scheduledAnswer = answer;
+                final waiters = <Future<void>>[Future.delayed(const Duration(seconds: 2))];
+                if (speechDone != null) {
+                  waiters.add(speechDone);
+                }
+                // ignore: unawaited_futures
+                Future.wait(waiters).then((_) async {
+                  if (!context.mounted) return;
+                  if (aiAnswer == scheduledAnswer && error == null && !sending) {
+                    // TTS should have finished naturally; just close the dialog.
+                    try { await Navigator.of(context).maybePop(); } catch (_) {}
+                  }
                 });
               } else {
                 setState(() {
@@ -935,6 +1156,7 @@ Future<void> _openAIAgentDialog(BuildContext context, {required Future<String> F
                 onPressed: sending
                     ? null
                     : () {
+                        try { TtsService.instance.stop(); } catch (_) {}
                         Navigator.of(context).pop();
                       },
                 child: const Text('Cancel'),
