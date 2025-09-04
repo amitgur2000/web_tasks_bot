@@ -1,0 +1,3 @@
+ID,Message name,"Message text, English","Message text, Hebrew",comments
+1,which_action,"Hello, which action would you want to do?",שלום. איזה פעולה תרצו לעשות?,
+2,action_not_found,"Sorry, your requested action was not found. Please press to ask again","סליחה, הפעולה המבוקשת לא נמצאה. בבקשה ללחוץ ולבקש שוב.",
