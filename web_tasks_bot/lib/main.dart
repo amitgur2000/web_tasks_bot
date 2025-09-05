@@ -111,6 +111,7 @@ class _LandingScreenState extends State<LandingScreen> {
   void initState() {
     super.initState();
     _loadPages();
+    _loadAndApplyLanguage();
   }
 
   Future<void> _loadPages() async {
@@ -125,6 +126,14 @@ class _LandingScreenState extends State<LandingScreen> {
     setState(() {
       _pages = result;
     });
+  }
+
+  Future<void> _loadAndApplyLanguage() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final lang = prefs.getString('app_language') ?? 'En';
+      await TtsService.instance.setLanguageByMenu(lang);
+    } catch (_) {}
   }
 
   Future<void> _savePages(List<SavedPage> pages) async {
@@ -200,7 +209,7 @@ class _LandingScreenState extends State<LandingScreen> {
             onSelected: (action) async {
               switch (action) {
                 case MainMenuAction.language:
-                  await showLanguageSelectionDialog(context);
+                  await _pickAndApplyLanguage(context);
                   break;
                 case MainMenuAction.about:
                   await showAboutDialog(context);
@@ -249,7 +258,11 @@ class _LandingScreenState extends State<LandingScreen> {
                 shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
               ),
               onPressed: () async {
-                await TtsService.instance.speakMessageById('1', preferEnglish: true);
+                try {
+                  final prefs = await SharedPreferences.getInstance();
+                  final lang = prefs.getString('app_language') ?? 'En';
+                  await TtsService.instance.speakMessageById('1', languageName: lang);
+                } catch (_) {}
               },
             ),
           ),
@@ -699,7 +712,7 @@ class _HomeScreenState extends State<HomeScreen> {
             onSelected: (action) async {
               switch (action) {
                 case MainMenuAction.language:
-                  await showLanguageSelectionDialog(context);
+                  await _pickAndApplyLanguage(context);
                   break;
                 case MainMenuAction.about:
                   await showAboutDialog(context);
@@ -973,13 +986,49 @@ Future<void> showLanguageSelectionDialog(BuildContext context) async {
             child: const Text('En'),
           ),
           SimpleDialogOption(
-            onPressed: () => Navigator.of(context).pop('Heb'),
-            child: const Text('Heb'),
+            onPressed: () => Navigator.of(context).pop('He'),
+            child: const Text('He'),
           ),
         ],
       );
     },
   );
+}
+
+Future<String?> _pickAndApplyLanguage(BuildContext context) async {
+  String? selected;
+  await showDialog(
+    context: context,
+    builder: (context) {
+      return SimpleDialog(
+        title: const Text('Language'),
+        children: [
+          SimpleDialogOption(
+            onPressed: () => Navigator.of(context).pop('En'),
+            child: const Text('En'),
+          ),
+          SimpleDialogOption(
+            onPressed: () => Navigator.of(context).pop('He'),
+            child: const Text('He'),
+          ),
+        ],
+      );
+    },
+  ).then((value) => selected = value as String?);
+  if (selected != null) {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString('app_language', selected!);
+      await TtsService.instance.setLanguageByMenu(selected!);
+    } catch (_) {}
+  } else {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString('app_language', 'En');
+      await TtsService.instance.setLanguageByMenu('En');
+    } catch (_) {}
+  }
+  return selected;
 }
 
 Future<void> showAboutDialog(BuildContext context) async {

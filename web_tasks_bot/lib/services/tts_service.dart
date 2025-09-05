@@ -14,6 +14,7 @@ class TtsService {
 
   final FlutterTts _tts = FlutterTts();
   bool _initialized = false;
+  String _languageName = 'En'; // 'En' or 'He'
 
   /// Initialize TTS settings once. Safe to call multiple times.
   Future<void> _initializeIfNeeded() async {
@@ -31,8 +32,8 @@ class TtsService {
     }
 
     try {
-      // Sensible defaults; can be tuned later or exposed via settings.
-      await _tts.setLanguage('en-US');
+      // Apply current language preference on init
+      await _applyCurrentTtsLanguage();
     } catch (_) {}
 
     try {
@@ -50,12 +51,27 @@ class TtsService {
     _initialized = true;
   }
 
+  Future<void> _applyCurrentTtsLanguage() async {
+    final isEnglish = _languageName.trim().toLowerCase().startsWith('en');
+    final locale = isEnglish ? 'en-US' : 'he-IL';
+    try { await _tts.setLanguage(locale); } catch (_) {}
+  }
+
+  /// Set current language by menu selection (e.g., 'En' or 'He').
+  Future<void> setLanguageByMenu(String languageName) async {
+    _languageName = languageName;
+    if (_initialized) {
+      await _applyCurrentTtsLanguage();
+    }
+  }
+
   /// Speak the provided [text]. If [interrupt] is true (default), any ongoing
   /// speech is stopped before speaking the new text.
   Future<void> speak(String text, {bool interrupt = true}) async {
     final trimmed = text.trim();
     if (trimmed.isEmpty) return;
     await _initializeIfNeeded();
+    await _applyCurrentTtsLanguage();
     if (interrupt) {
       await stop();
     }
@@ -70,9 +86,8 @@ class TtsService {
     } catch (_) {}
   }
 
-  /// Speak a message from the CSV by its [id]. If [preferEnglish] is true,
-  /// will prefer the English column text when available.
-  Future<void> speakMessageById(String id, {bool interrupt = true, bool preferEnglish = false}) async {
+  /// Speak a message from the CSV by its [id], using [languageName] ('En'/'He').
+  Future<void> speakMessageById(String id, {bool interrupt = true, String languageName = 'En'}) async {
     try {
       if (!VoiceTextService.instance.isLoaded) {
         try {
@@ -83,7 +98,8 @@ class TtsService {
           rethrow;
         }
       }
-      final text = VoiceTextService.instance.getTextById(id, preferEnglish: preferEnglish);
+      await setLanguageByMenu(languageName);
+      final text = VoiceTextService.instance.getTextById(id, languageName: languageName);
       if (text == null || text.trim().isEmpty) return;
       await speak(text, interrupt: interrupt);
     } catch (_) {}
